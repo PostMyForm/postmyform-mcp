@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -273,6 +274,113 @@ func TestUpdateFormPreservesRedirectOmitAndClearSemantics(t *testing.T) {
 				test.request,
 			); err != nil {
 				t.Fatalf("UpdateForm() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestMutationOperationsDoNotRetry(t *testing.T) {
+	t.Parallel()
+
+	formID := mustTestFormID(t)
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		call   func(context.Context, *Client) error
+	}{
+		{
+			name:   "create form",
+			method: http.MethodPost,
+			path:   "/forms",
+			call: func(ctx context.Context, client *Client) error {
+				_, err := client.CreateForm(ctx, CreateFormRequest{
+					Name:             "No retry",
+					DestinationEmail: "retry@example.com",
+				})
+				return err
+			},
+		},
+		{
+			name:   "update form",
+			method: http.MethodPatch,
+			path:   "/forms/" + testFormID,
+			call: func(ctx context.Context, client *Client) error {
+				name := "No retry update"
+				_, err := client.UpdateForm(
+					ctx,
+					formID,
+					PatchFormRequest{Name: &name},
+				)
+				return err
+			},
+		},
+		{
+			name:   "replace form fields",
+			method: http.MethodPut,
+			path:   "/forms/" + testFormID + "/fields",
+			call: func(ctx context.Context, client *Client) error {
+				_, err := client.ReplaceFormFields(
+					ctx,
+					formID,
+					ReplaceFormFieldsRequest{
+						Fields: []ReplaceFormField{
+							{
+								Name:      "email",
+								Label:     "Email",
+								FieldType: Email,
+								Required:  true,
+								Options:   nullable.NewNullableWithValue([]string{}),
+							},
+						},
+					},
+				)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requestCount atomic.Int32
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestCount.Add(1)
+
+				if r.Method != test.method {
+					t.Errorf("method = %q, want %q", r.Method, test.method)
+				}
+				if r.URL.Path != test.path {
+					t.Errorf("path = %q, want %q", r.URL.Path, test.path)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{
+					"error":{
+						"code":"organization_unavailable",
+						"message":"service temporarily unavailable"
+					}
+				}`))
+			}))
+			defer server.Close()
+
+			client, err := NewClient(server.URL, "test-token", 0)
+			if err != nil {
+				t.Fatalf("NewClient() error = %v", err)
+			}
+
+			err = test.call(context.Background(), client)
+			if err == nil {
+				t.Fatal("mutation error = nil, want server failure")
+			}
+
+			if got := requestCount.Load(); got != 1 {
+				t.Fatalf("request count = %d, want exactly 1", got)
 			}
 		})
 	}
