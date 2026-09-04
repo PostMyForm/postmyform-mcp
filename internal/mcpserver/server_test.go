@@ -461,3 +461,183 @@ func TestMCPProtocolSanitizesUpstreamErrors(t *testing.T) {
 		t.Fatal("CallTool(list_forms) leaked credential sentinel")
 	}
 }
+
+func TestToolInputSchemasExposeOnlyApprovedArguments(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server := New("test", &testAPIClient{})
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server.Connect() error = %v", err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(
+		&mcp.Implementation{
+			Name:    "postmyform-mcp-schema-test-client",
+			Version: "test",
+		},
+		nil,
+	)
+
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client.Connect() error = %v", err)
+	}
+	defer clientSession.Close()
+
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+
+	wantProperties := map[string][]string{
+		"list_forms":          {},
+		"get_form":            {"form_id"},
+		"get_form_fields":     {"form_id"},
+		"get_form_snippet":    {"form_id"},
+		"create_form":         {"allowed_origins", "destination_email", "name", "success_redirect_url"},
+		"update_form":         {"allowed_origins", "clear_success_redirect", "destination_email", "form_id", "name", "spam_honeypot_field", "status", "success_redirect_url"},
+		"replace_form_fields": {"fields", "form_id"},
+	}
+
+	for _, tool := range toolsResult.Tools {
+		want, ok := wantProperties[tool.Name]
+		if !ok {
+			t.Fatalf("unexpected tool %q", tool.Name)
+		}
+
+		schema, ok := tool.InputSchema.(map[string]any)
+		if !ok {
+			t.Fatalf("tool %q input schema type = %T, want map[string]any", tool.Name, tool.InputSchema)
+		}
+
+		properties, ok := schema["properties"].(map[string]any)
+		if !ok {
+			if len(want) == 0 && schema["properties"] == nil {
+				continue
+			}
+			t.Fatalf("tool %q properties type = %T, want map[string]any", tool.Name, schema["properties"])
+		}
+
+		if len(properties) != len(want) {
+			t.Fatalf(
+				"tool %q property count = %d, want %d: %#v",
+				tool.Name,
+				len(properties),
+				len(want),
+				properties,
+			)
+		}
+
+		for _, name := range want {
+			if _, ok := properties[name]; !ok {
+				t.Fatalf("tool %q missing approved property %q", tool.Name, name)
+			}
+		}
+
+		for name := range properties {
+			if !containsString(want, name) {
+				t.Fatalf("tool %q exposes unapproved property %q", tool.Name, name)
+			}
+		}
+	}
+}
+
+func TestToolSchemasDoNotExposeGenericDangerousInputs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server := New("test", &testAPIClient{})
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server.Connect() error = %v", err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(
+		&mcp.Implementation{
+			Name:    "postmyform-mcp-security-schema-test-client",
+			Version: "test",
+		},
+		nil,
+	)
+
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client.Connect() error = %v", err)
+	}
+	defer clientSession.Close()
+
+	toolsResult, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+
+	forbidden := map[string]struct{}{
+		"token":         {},
+		"api_token":     {},
+		"authorization": {},
+		"headers":       {},
+		"header":        {},
+		"method":        {},
+		"body":          {},
+		"url":           {},
+		"base_url":      {},
+		"command":       {},
+		"shell":         {},
+		"file":          {},
+		"filename":      {},
+		"path":          {},
+	}
+
+	for _, tool := range toolsResult.Tools {
+		assertNoForbiddenSchemaProperties(t, tool.Name, tool.InputSchema, forbidden)
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func assertNoForbiddenSchemaProperties(
+	t *testing.T,
+	toolName string,
+	value any,
+	forbidden map[string]struct{},
+) {
+	t.Helper()
+
+	switch typed := value.(type) {
+	case map[string]any:
+		if properties, ok := typed["properties"].(map[string]any); ok {
+			for name, propertySchema := range properties {
+				if _, blocked := forbidden[name]; blocked {
+					t.Fatalf("tool %q exposes forbidden property %q", toolName, name)
+				}
+				assertNoForbiddenSchemaProperties(t, toolName, propertySchema, forbidden)
+			}
+		}
+
+		if items, ok := typed["items"]; ok {
+			assertNoForbiddenSchemaProperties(t, toolName, items, forbidden)
+		}
+
+	case []any:
+		for _, item := range typed {
+			assertNoForbiddenSchemaProperties(t, toolName, item, forbidden)
+		}
+	}
+}
