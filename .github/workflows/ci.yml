@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            printf 'Files need gofmt:\n%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Verify pinned API contract
+        run: |
+          cd api
+          sha256sum -c openapi.sha256
+
+      - name: Check published API compatibility
+        env:
+          GOBIN: ${{ runner.temp }}/tools
+        run: |
+          mkdir -p "$GOBIN"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --output "${{ runner.temp }}/current-openapi.json" \
+            https://postmyform.com/openapi.json
+
+          if cmp -s api/openapi.json "${{ runner.temp }}/current-openapi.json"; then
+            echo "Published API contract matches the supported snapshot."
+          else
+            echo "Published API contract differs from the supported snapshot; checking compatibility."
+          fi
+
+          go install github.com/oasdiff/oasdiff@v1.30.0
+          "$GOBIN/oasdiff" breaking \
+            --fail-on ERR \
+            --allow-external-refs=false \
+            api/openapi.json \
+            "${{ runner.temp }}/current-openapi.json"
+
+      - name: Verify generated API models
+        env:
+          GOBIN: ${{ runner.temp }}/tools
+        run: |
+          mkdir -p "$GOBIN"
+          go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.8.0
+          "$GOBIN/oapi-codegen" --config api/oapi-codegen.yaml api/openapi.json
+          git diff --exit-code -- internal/api/models.gen.go
+
+      - name: Check vulnerabilities
+        env:
+          GOBIN: ${{ runner.temp }}/tools
+        run: |
+          mkdir -p "$GOBIN"
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          "$GOBIN/govulncheck" ./...
+
+  cross-build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            extension: ""
+          - goos: linux
+            goarch: arm64
+            extension: ""
+          - goos: darwin
+            goarch: amd64
+            extension: ""
+          - goos: darwin
+            goarch: arm64
+            extension: ""
+          - goos: windows
+            goarch: amd64
+            extension: ".exe"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: >
+          go build
+          -trimpath
+          -buildvcs=false
+          -o "postmyform-mcp${{ matrix.extension }}"
+          ./cmd/postmyform-mcp
