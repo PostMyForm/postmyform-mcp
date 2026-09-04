@@ -641,3 +641,114 @@ func assertNoForbiddenSchemaProperties(
 		}
 	}
 }
+
+type successfulReadAPIClient struct {
+	*testAPIClient
+	getFormIDs        []api.FormId
+	getFormFieldIDs   []api.FormId
+	getFormSnippetIDs []api.FormId
+}
+
+func (c *successfulReadAPIClient) GetForm(
+	_ context.Context,
+	formID api.FormId,
+) (api.Form, error) {
+	c.getFormIDs = append(c.getFormIDs, formID)
+	return api.Form{}, nil
+}
+
+func (c *successfulReadAPIClient) ListFormFields(
+	_ context.Context,
+	formID api.FormId,
+) ([]api.FormField, error) {
+	c.getFormFieldIDs = append(c.getFormFieldIDs, formID)
+	return []api.FormField{}, nil
+}
+
+func (c *successfulReadAPIClient) GetFormSnippet(
+	_ context.Context,
+	formID api.FormId,
+) (api.FormSnippet, error) {
+	c.getFormSnippetIDs = append(c.getFormSnippetIDs, formID)
+	return api.FormSnippet{
+		Html: "<form></form>",
+	}, nil
+}
+
+func TestRemainingReadToolsThroughMCPProtocol(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	apiClient := &successfulReadAPIClient{
+		testAPIClient: &testAPIClient{},
+	}
+	server := New("test", apiClient)
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server.Connect() error = %v", err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(
+		&mcp.Implementation{
+			Name:    "postmyform-mcp-read-test-client",
+			Version: "test",
+		},
+		nil,
+	)
+
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client.Connect() error = %v", err)
+	}
+	defer clientSession.Close()
+
+	tests := []struct {
+		name string
+	}{
+		{name: "get_form"},
+		{name: "get_form_fields"},
+		{name: "get_form_snippet"},
+	}
+
+	for _, test := range tests {
+		result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+			Name: test.name,
+			Arguments: map[string]any{
+				"form_id": testFormID,
+			},
+		})
+		if err != nil {
+			t.Fatalf("CallTool(%s) protocol error = %v", test.name, err)
+		}
+		if result.IsError {
+			t.Fatalf("CallTool(%s) returned tool error: %v", test.name, result.Content)
+		}
+	}
+
+	if len(apiClient.getFormIDs) != 1 ||
+		apiClient.getFormIDs[0].String() != testFormID {
+		t.Fatalf("GetForm IDs = %#v, want %s", apiClient.getFormIDs, testFormID)
+	}
+
+	if len(apiClient.getFormFieldIDs) != 1 ||
+		apiClient.getFormFieldIDs[0].String() != testFormID {
+		t.Fatalf(
+			"ListFormFields IDs = %#v, want %s",
+			apiClient.getFormFieldIDs,
+			testFormID,
+		)
+	}
+
+	if len(apiClient.getFormSnippetIDs) != 1 ||
+		apiClient.getFormSnippetIDs[0].String() != testFormID {
+		t.Fatalf(
+			"GetFormSnippet IDs = %#v, want %s",
+			apiClient.getFormSnippetIDs,
+			testFormID,
+		)
+	}
+}
