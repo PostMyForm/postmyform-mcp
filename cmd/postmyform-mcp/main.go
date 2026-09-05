@@ -13,6 +13,14 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "version", "--version":
+			fmt.Println(version)
+			return
+		}
+	}
+
 	client, err := api.NewClient(
 		os.Getenv("POSTMYFORM_API_BASE_URL"),
 		os.Getenv("POSTMYFORM_API_TOKEN"),

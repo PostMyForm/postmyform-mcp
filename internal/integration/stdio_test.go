@@ -185,3 +185,52 @@ func TestServerFailsClosedWithoutCredential(t *testing.T) {
 		t.Fatalf("stderr = %q, want prefix %q", stderr.String(), want)
 	}
 }
+
+func TestVersionDoesNotRequireCredential(t *testing.T) {
+	t.Parallel()
+
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+
+	for _, argument := range []string{"version", "--version"} {
+		argument := argument
+
+		t.Run(argument, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			command := exec.CommandContext(
+				ctx,
+				"go",
+				"run",
+				"./cmd/postmyform-mcp",
+				argument,
+			)
+			command.Dir = repoRoot
+			command.Env = withoutEnv(
+				os.Environ(),
+				"POSTMYFORM_API_TOKEN",
+				"POSTMYFORM_API_BASE_URL",
+			)
+
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			command.Stdout = &stdout
+			command.Stderr = &stderr
+
+			if err := command.Run(); err != nil {
+				t.Fatalf("command.Run() error = %v", err)
+			}
+
+			if stdout.String() != "dev\n" {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), "dev\n")
+			}
+
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+		})
+	}
+}
